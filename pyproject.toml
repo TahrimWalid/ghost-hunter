@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghosthunt"
+version = "0.1.0"
+description = "Find what is haunting a Linux machine -- read-only -- and let a local open-weight model tell you about it."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Tahrim Walid" }]
+requires-python = ">=3.8"
+dependencies = []
+classifiers = ["Operating System :: POSIX :: Linux", "Topic :: Security", "Environment :: Console"]
+
+[project.scripts]
+ghosthunt = "ghosthunt.cli:main"
+
+[tool.setuptools]
+packages = ["ghosthunt"]
