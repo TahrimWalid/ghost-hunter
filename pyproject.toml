@@ -7,8 +7,7 @@ name = "ghosthunt"
 version = "0.1.0"
 description = "Find what is haunting a Linux machine -- read-only -- and let a local open-weight model tell you about it."
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
+license = { text = "MIT" }
 authors = [{ name = "Tahrim Walid" }]
 requires-python = ">=3.8"
 dependencies = []

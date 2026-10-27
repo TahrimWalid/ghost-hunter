@@ -130,6 +130,7 @@ def test_departed_account_cron_and_preload_and_empty_history(machine):
     _w(machine, "/var/spool/cron/crontabs/alice", "\n")
     _w(machine, "/etc/ld.so.preload", "/usr/lib/libhide.so\n")
     _w(machine, "/var/log/wtmp", b"")
+    _w(machine, "/var/log/auth.log", AUTH_WITH_LOGIN)
     s = _scan(machine)
     assert _kinds(s) == ["cron", "memories", "possessed"]
     assert next(g for g in s.ghosts if g.kind == "cron").evidence["account"] == "olddev"
@@ -139,6 +140,7 @@ def test_departed_account_cron_and_preload_and_empty_history(machine):
 def test_a_compiled_program_in_tmp_owned_by_no_account(machine):
     _w(machine, "/tmp/.cache/miner", b"\x7fELF" + b"\0" * 60, mode=0o755)
     _w(machine, "/tmp/notes.sh", "#!/bin/sh\n", mode=0o755)        # a script, not a compiled program
+    _w(machine, "/tmp/pip-build/_cffi.cpython-312.so", b"\x7fELF" + b"\0" * 60, mode=0o755)   # a library
     s = _scan(machine)
     assert [g.evidence["file"] for g in s.ghosts if g.kind == "grave"] == ["/tmp/.cache/miner"]
 
@@ -242,7 +244,11 @@ def test_orphan_cron_on_rhel_and_alpine_layouts(machine):
     assert sorted(g.evidence["account"] for g in s.ghosts if g.kind == "cron") == ["ghost", "olddev"]
 
 
+AUTH_WITH_LOGIN = "Oct 27 09:00:01 web-01 sshd[811]: Accepted publickey for alice from 192.0.2.4 port 50000 ssh2\n"
+
+
 def test_newer_systems_keep_logins_in_wtmpdb(machine):
+    _w(machine, "/var/log/auth.log", AUTH_WITH_LOGIN)
     (machine / "var/log/wtmp").unlink()
     _w(machine, "/var/lib/wtmpdb/wtmp.db", b"SQLite format 3\0" + b"\0" * 100)
     assert [g for g in _scan(machine).ghosts if g.kind == "memories"] == []
@@ -282,3 +288,35 @@ def test_an_invented_name_in_quotes_falls_back_to_plain_words():
     assert not from_model
     text, from_model = N.narrate(GHOST, _Scripted(["It's still here, as 4242 -- don't let it linger."]))
     assert from_model                                  # apostrophes aren't quotes
+
+
+def test_an_empty_history_nobody_wrote_to_is_not_a_ghost(machine):
+    """A fresh image or a cloud machine nobody has logged in to has an empty wtmp: only
+    logins the auth log remembers make an empty history an erased one."""
+    _w(machine, "/var/log/wtmp", b"")
+    assert [g for g in _scan(machine).ghosts if g.kind == "memories"] == []
+    _w(machine, "/var/log/auth.log", "Oct 27 09:00:01 web-01 CRON[90]: (root) CMD (true)\n")
+    assert [g for g in _scan(machine).ghosts if g.kind == "memories"] == []
+    _w(machine, "/var/log/auth.log", AUTH_WITH_LOGIN)
+    [g] = [g for g in _scan(machine).ghosts if g.kind == "memories"]
+    assert g.severity == "high" and g.evidence["logins_in_auth_log"] == 1
+
+
+def test_a_young_container_is_not_judged_by_the_hosts_uptime(machine):
+    """Inside a container /proc/uptime is the host's; the container's own age is its PID 1's."""
+    started = int((time.time() - 60 - BOOT) * os.sysconf("SC_CLK_TCK"))
+    _proc(machine, 1, "sh", "/usr/sbin/sshd", cmd="sh", start_ticks=started)
+    _w(machine, "/var/log/wtmp", b"")
+    _w(machine, "/var/log/auth.log", AUTH_WITH_LOGIN)
+    assert [g for g in _scan(machine).ghosts if g.kind == "memories"] == []
+
+
+def test_an_unreadable_auth_log_is_a_dark_spot_not_a_verdict(machine):
+    if os.geteuid() == 0:
+        pytest.skip("root reads it anyway")
+    _w(machine, "/var/log/wtmp", b"")
+    _w(machine, "/var/log/auth.log", AUTH_WITH_LOGIN, mode=0o000)
+    s = _scan(machine)
+    assert [g for g in s.ghosts if g.kind == "memories"] == []
+    assert any("auth log couldn't be read" in b for b in s.blind_spots)
+

@@ -8,6 +8,7 @@ changed, killed or deleted, and nothing is sent anywhere. What a check could not
 from __future__ import annotations
 
 import os
+import re
 import stat
 import time
 from dataclasses import asdict, dataclass, field
@@ -17,6 +18,7 @@ SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 TEMP_DIRS = ("/tmp", "/var/tmp", "/dev/shm")
 MAX_TEMP_FILES = 2000          # per temp folder, so a flooded /tmp can't stall the hunt
 SWEEP_MARGIN = 32768           # beyond the highest listed PID, by default
+_LIBRARY = re.compile(r"\.so(\.\d+)*$")
 CRON_SPOOLS = ("/var/spool/cron/crontabs", "/var/spool/cron", "/etc/crontabs")   # Debian, RHEL, Alpine
 USER_WRITABLE = ("/home/", "/tmp/", "/var/tmp/", "/dev/shm/", "/var/spool/", "/root/")
 # Container runtimes run themselves from memory on purpose (runc's fix for CVE-2019-5736).
@@ -474,35 +476,65 @@ def check_phantom_ports(host: Host, scan: Scan, as_root: bool) -> None:
                 "processes."))
 
 
-def check_memories(host: Host, scan: Scan) -> None:
-    """A login history that is gone or empty on a machine that has been up for a while."""
-    scan.looked_at.append("the login history (wtmp / wtmpdb)")
+AUTH_LOGS = ("/var/log/auth.log", "/var/log/secure")
+_LOGIN_LINE = ("Accepted password for", "Accepted publickey for", "session opened for user")
+
+
+def _machine_age(host: Host) -> float:
+    """How long this machine (or container) has been up: from its own PID 1, since
+    /proc/uptime inside a container reports the host's uptime."""
+    p1 = read_proc(host, 1)
+    bt = _boot_time(host)
+    if p1 is not None and p1.started_ticks is not None and bt is not None:
+        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        return max(0.0, time.time() - (bt + p1.started_ticks / hz))
     up = (host.text("/proc/uptime") or "0").split()
-    uptime = float(up[0]) if up else 0.0
-    if uptime < 86400:
+    return float(up[0]) if up else 0.0
+
+
+def _logins_in_auth_log(host: Host) -> Optional[int]:
+    """Logins the auth log still records (None: no auth log could be read)."""
+    found = None
+    for f in AUTH_LOGS:
+        st = host.lstat(f)
+        if st is None:
+            continue
+        raw = host.read(f, 8 << 20)
+        if raw is None:
+            continue
+        txt = raw.decode("utf-8", "replace")
+        found = (found or 0) + sum(1 for ln in txt.splitlines() if any(k in ln for k in _LOGIN_LINE))
+    return found
+
+
+def check_memories(host: Host, scan: Scan) -> None:
+    """A login history that was erased: the auth log still shows logins, but the login
+    history (wtmp, or wtmpdb on newer systems) is missing or empty. An empty history on
+    a machine nobody has logged in to is normal -- not a ghost."""
+    scan.looked_at.append("the login history (wtmp / wtmpdb) against the auth log")
+    if _machine_age(host) < 3600:
         return
-    db = host.lstat("/var/lib/wtmpdb/wtmp.db")       # newer systems keep the history here instead
-    if db is not None:
-        if db.st_size == 0:
-            scan.ghosts.append(Ghost(
-                "", "memories", "The login history is empty", "medium",
-                {"file": "/var/lib/wtmpdb/wtmp.db", "size_bytes": 0, "up_for_days": round(uptime / 86400, 1)},
-                "wtmpdb records who logged in and when. An empty one on a machine up for days means the history "
-                "was wiped.", "Compare with the system journal's login records for the same days."))
+    db = host.lstat("/var/lib/wtmpdb/wtmp.db")
+    wtmp = host.lstat("/var/log/wtmp")
+    hist_file = "/var/lib/wtmpdb/wtmp.db" if db is not None else "/var/log/wtmp"
+    hist = db if db is not None else wtmp
+    if hist is not None and hist.st_size > 0:
         return
-    st = host.lstat("/var/log/wtmp")
-    if st is None:
-        scan.ghosts.append(Ghost(
-            "", "memories", "The login history is missing", "medium",
-            {"file": "/var/log/wtmp", "present": False, "up_for_days": round(uptime / 86400, 1)},
-            "wtmp records who logged in and when. A machine up for days with no wtmp at all has either never "
-            "recorded logins or had its history removed.", "Find out when and why /var/log/wtmp disappeared."))
-    elif st.st_size == 0:
-        scan.ghosts.append(Ghost(
-            "", "memories", "The login history is empty", "medium",
-            {"file": "/var/log/wtmp", "size_bytes": 0, "up_for_days": round(uptime / 86400, 1)},
-            "wtmp records who logged in and when. Emptying it is a classic way to erase the trail of a break-in.",
-            "Compare with the system journal's login records for the same days."))
+    logins = _logins_in_auth_log(host)
+    if logins is None:
+        if any(host.exists(f) for f in AUTH_LOGS):
+            scan.blind_spots.append("the auth log couldn't be read, so an erased login history couldn't be "
+                                    "told apart from one nobody wrote to (run as root)")
+        return
+    if logins == 0:
+        return
+    state = "missing" if hist is None else "empty"
+    scan.ghosts.append(Ghost(
+        "", "memories", f"The login history is {state}, but the auth log remembers logins", "high",
+        {"file": hist_file, "present": hist is not None, "logins_in_auth_log": logins},
+        "The auth log still records people logging in, yet the login history that should list them has been "
+        f"{'removed' if hist is None else 'emptied'}. Erasing it is a classic way to hide who was here.",
+        "Compare the auth log's logins with what `last` shows, and find out when the history was cleared."))
 
 
 def check_graves(host: Host, scan: Scan, by_uid: "Accounts") -> None:
@@ -521,8 +553,8 @@ def check_graves(host: Host, scan: Scan, by_uid: "Accounts") -> None:
                 if stat.S_ISDIR(st.st_mode):
                     stack.append(p)
                     continue
-                if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
-                    continue
+                if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111 or _LIBRARY.search(name):
+                    continue          # shared libraries: build tools and unpackers leave plenty in /tmp
                 head = host.read(p, 4) or b""
                 if head[:4] != b"\x7fELF":
                     continue
