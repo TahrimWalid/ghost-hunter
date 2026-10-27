@@ -63,7 +63,7 @@ quotes anything the evidence doesn't contain is withheld.
 Python 3.8 or newer, Linux, nothing else to install for the scan.
 
 ```bash
-pip install git+https://github.com/TahrimWalid/ghosthunt
+pip install git+https://github.com/TahrimWalid/ghost-hunter
 ghosthunt scan              # the checks only, no model
 sudo ghosthunt scan         # as root it sees every process and port
 ```
